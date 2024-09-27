@@ -16,7 +16,11 @@ from azure.cognitiveservices.speech import (
     SpeechSynthesizer,
 )
 from azure.core.exceptions import ResourceNotFoundError
-from azure.identity.aio import DefaultAzureCredential, get_bearer_token_provider
+from azure.identity.aio import (
+    AzureDeveloperCliCredential,
+    ManagedIdentityCredential,
+    get_bearer_token_provider,
+)
 from azure.monitor.opentelemetry import configure_azure_monitor
 from azure.search.documents.aio import SearchClient
 from azure.search.documents.indexes.aio import SearchIndexClient
@@ -436,11 +440,33 @@ async def setup_clients():
     USE_SPEECH_OUTPUT_BROWSER = os.getenv("USE_SPEECH_OUTPUT_BROWSER", "").lower() == "true"
     USE_SPEECH_OUTPUT_AZURE = os.getenv("USE_SPEECH_OUTPUT_AZURE", "").lower() == "true"
 
-    # Use the current user identity to authenticate with Azure OpenAI, AI Search and Blob Storage (no secrets needed,
-    # just use 'az login' locally, and managed identity when deployed on Azure). If you need to use keys, use separate AzureKeyCredential instances with the
-    # keys for each service
-    # If you encounter a blocking error during a DefaultAzureCredential resolution, you can exclude the problematic credential by using a parameter (ex. exclude_shared_token_cache_credential=True)
-    azure_credential = DefaultAzureCredential(exclude_shared_token_cache_credential=True)
+    # WEBSITE_HOSTNAME is always set by App Service, RUNNING_IN_PRODUCTION is set in main.bicep
+    RUNNING_ON_AZURE = os.getenv("WEBSITE_HOSTNAME") is not None or os.getenv("RUNNING_IN_PRODUCTION") is not None
+
+    # Use the current user identity for keyless authentication to Azure services.
+    # This assumes you use 'azd auth login' locally, and managed identity when deployed on Azure.
+    # The managed identity is setup in the infra/ folder.
+    azure_credential: Union[AzureDeveloperCliCredential, ManagedIdentityCredential]
+    if RUNNING_ON_AZURE:
+        current_app.logger.info("Setting up Azure credential using ManagedIdentityCredential")
+        if AZURE_CLIENT_ID := os.getenv("AZURE_CLIENT_ID"):
+            # ManagedIdentityCredential should use AZURE_CLIENT_ID if set in env, but its not working for some reason,
+            # so we explicitly pass it in as the client ID here. This is necessary for user-assigned managed identities.
+            current_app.logger.info(
+                "Setting up Azure credential using ManagedIdentityCredential with client_id %s", AZURE_CLIENT_ID
+            )
+            azure_credential = ManagedIdentityCredential(client_id=AZURE_CLIENT_ID)
+        else:
+            current_app.logger.info("Setting up Azure credential using ManagedIdentityCredential")
+            azure_credential = ManagedIdentityCredential()
+    elif AZURE_TENANT_ID:
+        current_app.logger.info(
+            "Setting up Azure credential using AzureDeveloperCliCredential with tenant_id %s", AZURE_TENANT_ID
+        )
+        azure_credential = AzureDeveloperCliCredential(tenant_id=AZURE_TENANT_ID, process_timeout=60)
+    else:
+        current_app.logger.info("Setting up Azure credential using AzureDeveloperCliCredential for home tenant")
+        azure_credential = AzureDeveloperCliCredential(process_timeout=60)
 
     # Set up clients for AI Search and Storage
     search_client = SearchClient(
@@ -688,9 +714,10 @@ def create_app():
     # Log levels should be one of https://docs.python.org/3/library/logging.html#logging-levels
     # Set root level to WARNING to avoid seeing overly verbose logs from SDKS
     logging.basicConfig(level=logging.WARNING)
-    # Set the app logger level to INFO by default
-    default_level = "INFO"
-    app.logger.setLevel(os.getenv("APP_LOG_LEVEL", default_level))
+    # Set our own logger levels to INFO by default
+    app_level = os.getenv("APP_LOG_LEVEL", "INFO")
+    app.logger.setLevel(os.getenv("APP_LOG_LEVEL", app_level))
+    logging.getLogger("scripts").setLevel(app_level)
 
     if allowed_origin := os.getenv("ALLOWED_ORIGIN"):
         app.logger.info("ALLOWED_ORIGIN is set, enabling CORS for %s", allowed_origin)
